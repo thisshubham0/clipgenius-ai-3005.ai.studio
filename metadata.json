@@ -1,0 +1,8 @@
+{
+  "name": "ClipGenius AI",
+  "description": "AI-powered video clipping studio that transforms long-form videos into short-form clips with synchronized captions, smart cropping, and viral potential analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
