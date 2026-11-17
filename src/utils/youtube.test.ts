@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildYouTubeEmbedUrl,
   computeEstimatedViralScore,
+  formatCaptionsToSrt,
   formatFileSize,
   formatTimecode,
   parseYouTubeUrl,
@@ -36,6 +38,7 @@ test('formatTimecode and formatFileSize format cleanly', () => {
   assert.equal(formatTimecode(65.4), '01:05');
   assert.equal(formatFileSize(512 * 1024), '512 KB');
   assert.equal(formatFileSize(3.5 * 1024 * 1024), '3.5 MB');
+  assert.equal(formatFileSize(1.5 * 1024 * 1024 * 1024), '1.50 GB');
 });
 
 test('computeEstimatedViralScore computes bounded weighted score', () => {
@@ -67,4 +70,22 @@ test('splitTranscriptIntoCaptions slices transcript cleanly within clip bounds',
   assert.ok(captions.length >= 2);
   assert.equal(captions[0].start, 0);
   assert.ok(captions[captions.length - 1].end <= 6.5);
+});
+
+test('buildYouTubeEmbedUrl constructs bounded start/end embed URLs', () => {
+  const url = buildYouTubeEmbedUrl('jNQXAC9IVRw', 12.4, 27.2);
+  assert.match(url, /^https:\/\/www\.youtube\.com\/embed\/jNQXAC9IVRw\?/);
+  assert.match(url, /start=12/);
+  assert.match(url, /end=28/);
+  assert.equal(buildYouTubeEmbedUrl('invalid', 0, 10), '');
+});
+
+test('formatCaptionsToSrt produces valid SRT cues', () => {
+  const srt = formatCaptionsToSrt([
+    { id: 'c1', start: 0, end: 2.5, text: 'First subtitle line' },
+    { id: 'c2', start: 65.125, end: 68.5, text: 'Second subtitle line' },
+  ]);
+  assert.match(srt, /^1\n00:00:00,000 --> 00:00:02,500\nFirst subtitle line/m);
+  assert.match(srt, /^2\n00:01:05,125 --> 00:01:08,500\nSecond subtitle line/m);
+  assert.equal(formatCaptionsToSrt([]), '');
 });

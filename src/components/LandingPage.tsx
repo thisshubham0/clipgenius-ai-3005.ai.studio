@@ -227,7 +227,7 @@ export function LandingPage({
               {[
                 {
                   num: '01. Acquire & Inspect',
-                  desc: 'Validate YouTube URLs for oEmbed metadata, or upload MP4/MOV footage directly with strict permission compliance.',
+                  desc: 'Analyze public YouTube URLs directly with Gemini Multimodal AI, or upload MP4/MOV footage for full FFmpeg rendering.',
                 },
                 {
                   num: '02. Transcribe & Score',

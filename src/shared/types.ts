@@ -1,5 +1,24 @@
 export type AspectRatio = '9:16' | '1:1' | '16:9';
-export type CaptionStyle = 'Minimal' | 'Animated' | 'Bold' | 'Karaoke' | 'Modern';
+export type CaptionStyle =
+  | 'Minimal'
+  | 'Neon Glow'
+  | 'Professional'
+  | 'Animated'
+  | 'Bold'
+  | 'Karaoke'
+  | 'Modern'
+  | 'Comic Pop'
+  | 'Gradient Box'
+  | 'Typewriter'
+  | 'Glitch Kinetic';
+export type VideoTheme =
+  | 'Original'
+  | 'Cinematic'
+  | 'Neon Cyber'
+  | 'Warm Sunset'
+  | 'Noir Monochrome'
+  | 'Vibrant Pop'
+  | 'Studio Clean';
 export type ContentStyle = 'Educational' | 'Podcast' | 'Motivational' | 'Entertainment' | 'Business';
 export type ExportResolution = '720p' | '1080p';
 
@@ -33,6 +52,7 @@ export interface ProjectConfig {
   clipDuration: number; // target seconds: 15 | 30 | 45 | 60 | 90
   aspectRatio: AspectRatio;
   captionStyle: CaptionStyle;
+  videoTheme?: VideoTheme;
   contentStyle: ContentStyle;
   enhanceAudio: boolean;
   trimSilence: boolean;
@@ -73,6 +93,7 @@ export interface ClipDTO {
   durationSec: number;
   aspectRatio: AspectRatio;
   captionStyle: CaptionStyle;
+  videoTheme: VideoTheme;
   fontFamily: string;
   highlightColor: string;
   cropX: number;
@@ -138,6 +159,7 @@ export interface YouTubeInspectResult {
   channelName: string;
   thumbnailUrl: string;
   directStreamPermitted: boolean;
+  aiUrlAnalysisSupported?: boolean;
   permissionReason: string;
 }
 

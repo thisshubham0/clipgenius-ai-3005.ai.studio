@@ -17,12 +17,13 @@ import {
   mapClipRow,
   mapProjectRow,
   recordDownloadRow,
+  recoverInterruptedProjects,
   updateClipRow,
   updateProjectRow,
 } from './src/db/queries.ts';
 import { updateUserPreferences } from './src/db/users.ts';
 import { AuthRequest, requireAuth, signDemoToken } from './src/middleware/auth.ts';
-import { regenerateClipCopy } from './src/server/geminiService.ts';
+import { aiEditClipStylingAndCaptions, regenerateClipCopy } from './src/server/geminiService.ts';
 import { enqueueProjectPipeline, getJobProgress } from './src/server/jobQueue.ts';
 import {
   ensureSampleVideoExists,
@@ -30,6 +31,8 @@ import {
   getUploadsDir,
   probeVideoMetadata,
   renderClipMp4,
+  renderYouTubeMotionClipMp4,
+  resolveProjectSourceFile,
   STUDIO_SAMPLES,
 } from './src/server/mediaPipeline.ts';
 import type {
@@ -39,12 +42,17 @@ import type {
   ExportResolution,
   ProjectConfig,
   TranscriptSegment,
+  VideoTheme,
 } from './src/shared/types.ts';
-import { parseYouTubeUrl } from './src/utils/youtube.ts';
+import { normalizeCaptionStyle, normalizeVideoTheme } from './src/utils/videoStyles.ts';
+import { formatCaptionsToSrt, parseYouTubeUrl } from './src/utils/youtube.ts';
+
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 const PORT = Number(process.env.PORT_OVERRIDE || 3000);
-const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
-const MAX_DURATION_SEC = 3600;
+const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
+const MAX_DURATION_SEC = 10800; // 3 hours
 
 // Simple sliding-window rate limiter for AI/render endpoints
 const rateBuckets = new Map<string, number[]>();
@@ -66,7 +74,7 @@ const uploadStorage = multer.diskStorage({
   },
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase() || '.mp4';
-    const safeExt = ['.mp4', '.mov', '.webm', '.m4v'].includes(ext) ? ext : '.mp4';
+    const safeExt = ['.mp4', '.mov', '.webm', '.m4v', '.mkv'].includes(ext) ? ext : '.mp4';
     cb(null, `upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${safeExt}`);
   },
 });
@@ -77,9 +85,10 @@ const upload = multer({
   fileFilter: (_req, file, cb) => {
     const allowedMime =
       file.mimetype.startsWith('video/') ||
-      /\.(mp4|mov|webm|m4v)$/i.test(file.originalname);
+      file.mimetype === 'application/octet-stream' ||
+      /\.(mp4|mov|webm|m4v|mkv)$/i.test(file.originalname);
     if (!allowedMime) {
-      return cb(new Error('Unsupported file format. Please upload MP4, MOV, or WebM video files.'));
+      return cb(new Error('Unsupported file format. Please upload MP4, MOV, WebM, M4V, or MKV video files.'));
     }
     cb(null, true);
   },
@@ -87,6 +96,12 @@ const upload = multer({
 
 async function startServer() {
   await ensureStorageDirectories();
+  const recoveredCount = await recoverInterruptedProjects();
+  if (recoveredCount > 0) {
+    console.info(`[Startup] Recovered ${recoveredCount} interrupted project job(s) to retryable error state.`);
+  }
+  // Pre-warm Studio Samples in the background so project creation is near-instant
+  void Promise.allSettled(STUDIO_SAMPLES.map((sample) => ensureSampleVideoExists(sample.id)));
 
   const app = express();
   app.use(express.json({ limit: '4mb' }));
@@ -201,8 +216,9 @@ async function startServer() {
       channelName,
       thumbnailUrl,
       directStreamPermitted: false,
+      aiUrlAnalysisSupported: true,
       permissionReason:
-        'Direct YouTube stream extraction is restricted by platform terms and DRM protections. Attach your authorized video file (MP4/MOV/WebM) or launch a Studio Sample Video to run real audio transcription, AI clipping, and MP4 rendering.',
+        'ClipGenius AI analyzes public YouTube videos directly via Gemini Multimodal AI to extract transcripts, viral hooks, engagement scores, and timestamped clip previews. Attach an MP4/MOV file anytime if you also want standalone FFmpeg MP4 downloads.',
     });
   });
 
@@ -211,7 +227,7 @@ async function startServer() {
       if (err) {
         const message =
           err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE'
-            ? 'Video file exceeds the 250 MB limit.'
+            ? 'Video file exceeds the 2 GB upload limit.'
             : err.message || 'Video upload failed.';
         return res.status(400).json({ error: message });
       }
@@ -225,7 +241,7 @@ async function startServer() {
         if (probe.durationSec > MAX_DURATION_SEC) {
           await fsp.unlink(req.file.path).catch(() => {});
           return res.status(400).json({
-            error: 'Video exceeds the 60-minute duration limit for this workspace.',
+            error: 'Video exceeds the 3-hour duration limit for this workspace.',
           });
         }
 
@@ -298,35 +314,60 @@ async function startServer() {
           return res.status(400).json({ error: 'Enter a valid HTTP/HTTPS MP4 video URL.' });
         }
         const dlRes = await fetch(directUrl);
-        if (!dlRes.ok) {
+        if (!dlRes.ok || !dlRes.body) {
           return res.status(400).json({ error: `Unable to fetch media URL (HTTP ${dlRes.status}).` });
         }
         const contentType = dlRes.headers.get('content-type') || '';
-        if (!contentType.includes('video/') && !directUrl.toLowerCase().includes('.mp4')) {
+        const contentLength = Number(dlRes.headers.get('content-length') || 0);
+        if (contentLength > MAX_UPLOAD_BYTES) {
+          return res.status(400).json({ error: 'Remote video exceeds the 2 GB limit.' });
+        }
+        if (
+          !contentType.includes('video/') &&
+          !contentType.includes('application/octet-stream') &&
+          !/\.(mp4|mov|webm|m4v|mkv)(\?|$)/i.test(directUrl)
+        ) {
           return res.status(400).json({
             error: 'URL did not return a direct video stream. Please provide a direct MP4 URL or upload a file.',
           });
         }
-        const buf = Buffer.from(await dlRes.arrayBuffer());
-        if (buf.length > MAX_UPLOAD_BYTES) {
-          return res.status(400).json({ error: 'Remote video exceeds the 250 MB limit.' });
-        }
         const filePath = path.join(getUploadsDir(), `remote-${Date.now()}.mp4`);
-        await fsp.writeFile(filePath, buf);
-        const probe = await probeVideoMetadata(filePath);
-        const project = await createProject({
-          userId: u.id,
-          title: String(req.body?.title ?? 'Imported MP4 Video'),
-          sourceType: 'url',
-          sourceUrl: directUrl,
-          channelName: 'Authorized Remote Media',
-          thumbnailUrl: '/src/assets/images/hero_studio_preview_1794825184394.jpg',
-          durationSec: probe.durationSec,
-          sourceFilePath: filePath,
-          status: 'draft',
-          config: req.body?.config,
+        let receivedBytes = 0;
+        const nodeStream = Readable.fromWeb(dlRes.body as unknown as import('node:stream/web').ReadableStream);
+        nodeStream.on('data', (chunk: Buffer) => {
+          receivedBytes += chunk.length;
+          if (receivedBytes > MAX_UPLOAD_BYTES) {
+            nodeStream.destroy(new Error('Remote video exceeds the 2 GB limit.'));
+          }
         });
-        return res.status(201).json({ project: mapProjectRow(project, 0) });
+        try {
+          await pipeline(nodeStream, fs.createWriteStream(filePath));
+          const probe = await probeVideoMetadata(filePath);
+          if (probe.durationSec > MAX_DURATION_SEC) {
+            await fsp.unlink(filePath).catch(() => {});
+            return res.status(400).json({
+              error: 'Remote video exceeds the 3-hour duration limit for this workspace.',
+            });
+          }
+          const project = await createProject({
+            userId: u.id,
+            title: String(req.body?.title ?? 'Imported MP4 Video'),
+            sourceType: 'url',
+            sourceUrl: directUrl,
+            channelName: 'Authorized Remote Media',
+            thumbnailUrl: '/src/assets/images/hero_studio_preview_1794825184394.jpg',
+            durationSec: probe.durationSec,
+            sourceFilePath: filePath,
+            status: 'draft',
+            config: req.body?.config,
+          });
+          return res.status(201).json({ project: mapProjectRow(project, 0) });
+        } catch (dlErr) {
+          await fsp.unlink(filePath).catch(() => {});
+          return res.status(400).json({
+            error: dlErr instanceof Error ? dlErr.message : 'Failed to import remote video URL.',
+          });
+        }
       }
 
       // YouTube metadata project (requires attaching authorized file or studio sample before rendering)
@@ -364,16 +405,27 @@ async function startServer() {
       const projectId = Number(req.params.id);
       const existing = await getProjectByIdForUser(projectId, u.id);
       if (!existing) {
+        if (req.file) await fsp.unlink(req.file.path).catch(() => {});
         return res.status(404).json({ error: 'Project not found.' });
       }
 
       if (err) {
-        return res.status(400).json({ error: err.message || 'Upload failed.' });
+        const message =
+          err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE'
+            ? 'Video file exceeds the 2 GB upload limit.'
+            : err.message || 'Upload failed.';
+        return res.status(400).json({ error: message });
       }
 
       try {
         if (req.file) {
           const probe = await probeVideoMetadata(req.file.path);
+          if (probe.durationSec > MAX_DURATION_SEC) {
+            await fsp.unlink(req.file.path).catch(() => {});
+            return res.status(400).json({
+              error: 'Video exceeds the 3-hour duration limit for this workspace.',
+            });
+          }
           const updated = await updateProjectRow(projectId, u.id, {
             sourceFilePath: req.file.path,
             durationSec: probe.durationSec,
@@ -401,7 +453,8 @@ async function startServer() {
 
         return res.status(400).json({ error: 'Provide a video file or studio sample ID.' });
       } catch (attachErr) {
-        res.status(500).json({
+        if (req.file) await fsp.unlink(req.file.path).catch(() => {});
+        res.status(400).json({
           error: attachErr instanceof Error ? attachErr.message : 'Failed to attach video source.',
         });
       }
@@ -456,10 +509,10 @@ async function startServer() {
       if (!project) {
         return res.status(404).json({ error: 'Project not found.' });
       }
-      if (!project.sourceFilePath) {
+      if (!project.sourceFilePath && project.sourceType !== 'sample' && project.sourceType !== 'youtube') {
         return res.status(400).json({
           error:
-            'No authorized video file attached. Upload your video file or select an Authorized Studio Sample before analyzing.',
+            'No authorized video file attached. Paste a YouTube URL, upload your video file, or select an Authorized Studio Sample before analyzing.',
         });
       }
 
@@ -486,7 +539,8 @@ async function startServer() {
         clipCount: Math.max(1, Math.min(10, Number(incoming.clipCount ?? existingConfig.clipCount ?? 3))),
         clipDuration: Math.max(10, Math.min(90, Number(incoming.clipDuration ?? existingConfig.clipDuration ?? 30))),
         aspectRatio: (incoming.aspectRatio ?? existingConfig.aspectRatio ?? '9:16') as AspectRatio,
-        captionStyle: (incoming.captionStyle ?? existingConfig.captionStyle ?? 'Modern') as CaptionStyle,
+        captionStyle: normalizeCaptionStyle(incoming.captionStyle ?? existingConfig.captionStyle),
+        videoTheme: normalizeVideoTheme(incoming.videoTheme ?? existingConfig.videoTheme),
         contentStyle: (incoming.contentStyle ?? existingConfig.contentStyle ?? 'Podcast') as ProjectConfig['contentStyle'],
         enhanceAudio: Boolean(incoming.enhanceAudio ?? existingConfig.enhanceAudio ?? true),
         trimSilence: Boolean(incoming.trimSilence ?? existingConfig.trimSilence ?? false),
@@ -495,13 +549,17 @@ async function startServer() {
         resolution: (incoming.resolution ?? existingConfig.resolution ?? '1080p') as ExportResolution,
       };
 
-      enqueueProjectPipeline({
+      const jobResult = enqueueProjectPipeline({
         projectId,
         userId: u.id,
         config: mergedConfig,
       });
 
-      res.json({ started: true, progress: getJobProgress(projectId) });
+      res.json({
+        started: true,
+        alreadyRunning: jobResult.alreadyRunning,
+        progress: jobResult.progress,
+      });
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to start analysis.' });
     }
@@ -549,6 +607,151 @@ async function startServer() {
     }
   });
 
+  app.post('/api/clips/:id/ai-edit', requireAuth, async (req: AuthRequest, res) => {
+    const u = req.authUser!;
+    if (!checkRateLimit(`aiedit:${u.id}`, 20, 60_000)) {
+      return res.status(429).json({ error: 'Too many AI edit requests. Please wait a moment.' });
+    }
+
+    try {
+      const clipId = Number(req.params.id);
+      const prompt = String(req.body?.prompt ?? '').trim().slice(0, 600);
+      if (!prompt) {
+        return res.status(400).json({ error: 'Describe the caption style or video theme changes you want AI to apply.' });
+      }
+
+      const clip = await getClipByIdForUser(clipId, u.id);
+      if (!clip) {
+        return res.status(404).json({ error: 'Clip not found.' });
+      }
+      const project = await getProjectByIdForUser(clip.projectId, u.id);
+      if (!project) {
+        return res.status(404).json({ error: 'Parent project not found.' });
+      }
+
+      let currentCaptions: CaptionLine[] = [];
+      try {
+        currentCaptions = JSON.parse(clip.captionsJson || '[]') as CaptionLine[];
+      } catch {
+        currentCaptions = [];
+      }
+
+      const aiResult = await aiEditClipStylingAndCaptions({
+        prompt,
+        projectTitle: project.title,
+        clipTitle: clip.title,
+        hook: clip.hook,
+        description: clip.description,
+        hashtags: clip.hashtags,
+        durationSec: clip.durationSec,
+        captionStyle: normalizeCaptionStyle(clip.captionStyle),
+        videoTheme: normalizeVideoTheme(clip.videoTheme),
+        fontFamily: clip.fontFamily,
+        highlightColor: clip.highlightColor,
+        captions: currentCaptions,
+      });
+
+      const previousRenderPath = clip.renderPath;
+
+      if (!project.sourceFilePath && project.sourceType === 'youtube') {
+        const updated = await updateClipRow(clipId, u.id, {
+          videoTheme: aiResult.videoTheme,
+          captionStyle: aiResult.captionStyle,
+          fontFamily: aiResult.fontFamily,
+          highlightColor: aiResult.highlightColor,
+          captionsJson: JSON.stringify(aiResult.captions),
+          title: aiResult.title,
+          hook: aiResult.hook,
+          description: aiResult.description,
+          hashtags: aiResult.hashtags,
+          renderPath: '',
+          renderStatus: 'pending',
+          fileSizeBytes: 0,
+        });
+        if (previousRenderPath) {
+          await fsp.unlink(previousRenderPath).catch(() => {});
+        }
+        return res.json({ clip: mapClipRow(updated!), aiSummary: aiResult.aiSummary });
+      }
+
+      const resolvedSourcePath = await resolveProjectSourceFile(
+        project.sourceType,
+        project.sourceFilePath
+      );
+      if (resolvedSourcePath !== project.sourceFilePath) {
+        await updateProjectRow(project.id, u.id, { sourceFilePath: resolvedSourcePath });
+      }
+
+      await updateClipRow(clipId, u.id, { renderStatus: 'rendering' });
+
+      try {
+        const rendered = await renderClipMp4({
+          clipId,
+          sourceFilePath: resolvedSourcePath,
+          startSec: clip.startSec,
+          endSec: clip.endSec,
+          aspectRatio: clip.aspectRatio as AspectRatio,
+          resolution: clip.renderResolution as ExportResolution,
+          captionStyle: aiResult.captionStyle,
+          videoTheme: aiResult.videoTheme,
+          fontFamily: aiResult.fontFamily,
+          highlightColor: aiResult.highlightColor,
+          cropX: clip.cropX,
+          enhanceAudio: clip.enhanceAudio,
+          trimSilence: clip.trimSilence,
+          bgMusic: clip.bgMusic,
+          includeIntroOutro: clip.includeIntroOutro,
+          captions: aiResult.captions,
+        });
+
+        const updated = await updateClipRow(clipId, u.id, {
+          videoTheme: aiResult.videoTheme,
+          captionStyle: aiResult.captionStyle,
+          fontFamily: aiResult.fontFamily,
+          highlightColor: aiResult.highlightColor,
+          captionsJson: JSON.stringify(aiResult.captions),
+          title: aiResult.title,
+          hook: aiResult.hook,
+          description: aiResult.description,
+          hashtags: aiResult.hashtags,
+          renderPath: rendered.renderPath,
+          renderStatus: 'ready',
+          fileSizeBytes: rendered.fileSizeBytes,
+          durationSec: rendered.durationSec,
+        });
+
+        if (previousRenderPath && previousRenderPath !== rendered.renderPath) {
+          await fsp.unlink(previousRenderPath).catch(() => {});
+        }
+
+        res.json({ clip: mapClipRow(updated!), aiSummary: aiResult.aiSummary });
+      } catch (renderErr) {
+        await updateClipRow(clipId, u.id, { renderStatus: 'error' }).catch(() => {});
+        throw renderErr;
+      }
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'AI editing failed.' });
+    }
+  });
+
+  app.get('/api/clips/:id/context', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const u = req.authUser!;
+      const clipId = Number(req.params.id);
+      const clip = await getClipByIdForUser(clipId, u.id);
+      if (!clip) {
+        return res.status(404).json({ error: 'Clip not found.' });
+      }
+      const project = await getProjectWithClipsForUser(clip.projectId, u.id);
+      if (!project) {
+        return res.status(404).json({ error: 'Parent project not found.' });
+      }
+      res.json({ clip: mapClipRow(clip), project });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load clip editor context.' });
+    }
+  });
+
   app.patch('/api/clips/:id', requireAuth, async (req: AuthRequest, res) => {
     try {
       const u = req.authUser!;
@@ -558,15 +761,16 @@ async function startServer() {
         return res.status(404).json({ error: 'Clip not found.' });
       }
       const project = await getProjectByIdForUser(clip.projectId, u.id);
-      if (!project || !project.sourceFilePath) {
-        return res.status(400).json({ error: 'Source video file is unavailable for re-rendering.' });
+      if (!project) {
+        return res.status(400).json({ error: 'Parent project not found.' });
       }
 
       const startSec = Math.max(0, Number(req.body?.startSec ?? clip.startSec));
-      const maxEnd = project.durationSec > 0 ? project.durationSec : clip.endSec;
+      const maxEnd = project.durationSec > 0 ? project.durationSec : Math.max(clip.endSec, startSec + 60);
       const endSec = Math.min(maxEnd, Math.max(startSec + 2, Number(req.body?.endSec ?? clip.endSec)));
       const aspectRatio = (req.body?.aspectRatio ?? clip.aspectRatio) as AspectRatio;
-      const captionStyle = (req.body?.captionStyle ?? clip.captionStyle) as CaptionStyle;
+      const captionStyle = normalizeCaptionStyle(req.body?.captionStyle ?? clip.captionStyle);
+      const videoTheme = normalizeVideoTheme(req.body?.videoTheme ?? clip.videoTheme) as VideoTheme;
       const fontFamily = String(req.body?.fontFamily ?? clip.fontFamily);
       const highlightColor = String(req.body?.highlightColor ?? clip.highlightColor);
       const cropX = Math.max(0, Math.min(1, Number(req.body?.cropX ?? clip.cropX)));
@@ -583,66 +787,215 @@ async function startServer() {
         ? req.body.captions
         : (JSON.parse(clip.captionsJson || '[]') as CaptionLine[]);
 
+      if (!project.sourceFilePath && project.sourceType === 'youtube') {
+        const previousRenderPath = clip.renderPath;
+        const updated = await updateClipRow(clipId, u.id, {
+          title,
+          hook,
+          description,
+          hashtags,
+          startSec,
+          endSec,
+          durationSec: Number(Math.max(1.5, endSec - startSec).toFixed(2)),
+          aspectRatio,
+          captionStyle,
+          videoTheme,
+          fontFamily,
+          highlightColor,
+          cropX,
+          enhanceAudio,
+          trimSilence,
+          bgMusic,
+          includeIntroOutro,
+          captionsJson: JSON.stringify(captions),
+          renderPath: '',
+          renderStatus: 'pending',
+          renderResolution,
+          fileSizeBytes: 0,
+        });
+        if (previousRenderPath) {
+          await fsp.unlink(previousRenderPath).catch(() => {});
+        }
+        return res.json({ clip: mapClipRow(updated!) });
+      }
+
+      let resolvedSourcePath: string;
+      try {
+        resolvedSourcePath = await resolveProjectSourceFile(
+          project.sourceType,
+          project.sourceFilePath
+        );
+        if (resolvedSourcePath !== project.sourceFilePath) {
+          await updateProjectRow(project.id, u.id, { sourceFilePath: resolvedSourcePath });
+        }
+      } catch (srcErr) {
+        return res.status(400).json({
+          error: srcErr instanceof Error ? srcErr.message : 'Source video file is unavailable for re-rendering.',
+        });
+      }
+
       await updateClipRow(clipId, u.id, { renderStatus: 'rendering' });
 
-      const rendered = await renderClipMp4({
-        clipId,
-        sourceFilePath: project.sourceFilePath,
-        startSec,
-        endSec,
-        aspectRatio,
-        resolution: renderResolution,
-        captionStyle,
-        fontFamily,
-        highlightColor,
-        cropX,
-        enhanceAudio,
-        trimSilence,
-        bgMusic,
-        includeIntroOutro,
-        captions,
-      });
+      try {
+        const rendered = await renderClipMp4({
+          clipId,
+          sourceFilePath: resolvedSourcePath,
+          startSec,
+          endSec,
+          aspectRatio,
+          resolution: renderResolution,
+          captionStyle,
+          videoTheme,
+          fontFamily,
+          highlightColor,
+          cropX,
+          enhanceAudio,
+          trimSilence,
+          bgMusic,
+          includeIntroOutro,
+          captions,
+        });
 
-      const updated = await updateClipRow(clipId, u.id, {
-        title,
-        hook,
-        description,
-        hashtags,
-        startSec,
-        endSec,
-        durationSec: rendered.durationSec,
-        aspectRatio,
-        captionStyle,
-        fontFamily,
-        highlightColor,
-        cropX,
-        enhanceAudio,
-        trimSilence,
-        bgMusic,
-        includeIntroOutro,
-        captionsJson: JSON.stringify(captions),
-        renderPath: rendered.renderPath,
-        renderStatus: 'ready',
-        renderResolution,
-        fileSizeBytes: rendered.fileSizeBytes,
-      });
+        const previousRenderPath = clip.renderPath;
+        const updated = await updateClipRow(clipId, u.id, {
+          title,
+          hook,
+          description,
+          hashtags,
+          startSec,
+          endSec,
+          durationSec: rendered.durationSec,
+          aspectRatio,
+          captionStyle,
+          videoTheme,
+          fontFamily,
+          highlightColor,
+          cropX,
+          enhanceAudio,
+          trimSilence,
+          bgMusic,
+          includeIntroOutro,
+          captionsJson: JSON.stringify(captions),
+          renderPath: rendered.renderPath,
+          renderStatus: 'ready',
+          renderResolution,
+          fileSizeBytes: rendered.fileSizeBytes,
+        });
 
-      res.json({ clip: mapClipRow(updated!) });
+        if (previousRenderPath && previousRenderPath !== rendered.renderPath) {
+          await fsp.unlink(previousRenderPath).catch(() => {});
+        }
+
+        res.json({ clip: mapClipRow(updated!) });
+      } catch (renderErr) {
+        await updateClipRow(clipId, u.id, { renderStatus: 'error' }).catch(() => {});
+        throw renderErr;
+      }
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to render updated clip.' });
     }
   });
+
+  async function ensureRenderedClipOnDisk(
+    clip: NonNullable<Awaited<ReturnType<typeof getClipByIdForUser>>>,
+    userId: number
+  ): Promise<{ renderPath: string; fileSizeBytes: number } | null> {
+    if (clip.renderPath) {
+      const existingStat = await fsp.stat(clip.renderPath).catch(() => null);
+      if (existingStat && existingStat.size > 0) {
+        return { renderPath: clip.renderPath, fileSizeBytes: existingStat.size };
+      }
+    }
+
+    const project = await getProjectByIdForUser(clip.projectId, userId);
+    if (!project) return null;
+
+    const captions = JSON.parse(clip.captionsJson || '[]') as CaptionLine[];
+
+    if (!project.sourceFilePath && project.sourceType === 'youtube') {
+      try {
+        const rendered = await renderYouTubeMotionClipMp4({
+          clipId: clip.id,
+          thumbnailUrl: project.thumbnailUrl,
+          youtubeId: project.youtubeId,
+          startSec: clip.startSec,
+          endSec: clip.endSec,
+          aspectRatio: clip.aspectRatio as AspectRatio,
+          resolution: clip.renderResolution as ExportResolution,
+          captionStyle: normalizeCaptionStyle(clip.captionStyle),
+          videoTheme: normalizeVideoTheme(clip.videoTheme),
+          fontFamily: clip.fontFamily,
+          highlightColor: clip.highlightColor,
+          cropX: clip.cropX,
+          bgMusic: clip.bgMusic,
+          includeIntroOutro: clip.includeIntroOutro,
+          captions,
+        });
+        await updateClipRow(clip.id, userId, {
+          renderPath: rendered.renderPath,
+          renderStatus: 'ready',
+          fileSizeBytes: rendered.fileSizeBytes,
+          durationSec: rendered.durationSec,
+        });
+        return { renderPath: rendered.renderPath, fileSizeBytes: rendered.fileSizeBytes };
+      } catch {
+        return null;
+      }
+    }
+
+    try {
+      const resolvedSourcePath = await resolveProjectSourceFile(
+        project.sourceType,
+        project.sourceFilePath
+      );
+      if (resolvedSourcePath !== project.sourceFilePath) {
+        await updateProjectRow(project.id, userId, { sourceFilePath: resolvedSourcePath });
+      }
+      const rendered = await renderClipMp4({
+        clipId: clip.id,
+        sourceFilePath: resolvedSourcePath,
+        startSec: clip.startSec,
+        endSec: clip.endSec,
+        aspectRatio: clip.aspectRatio as AspectRatio,
+        resolution: clip.renderResolution as ExportResolution,
+        captionStyle: normalizeCaptionStyle(clip.captionStyle),
+        videoTheme: normalizeVideoTheme(clip.videoTheme),
+        fontFamily: clip.fontFamily,
+        highlightColor: clip.highlightColor,
+        cropX: clip.cropX,
+        enhanceAudio: clip.enhanceAudio,
+        trimSilence: clip.trimSilence,
+        bgMusic: clip.bgMusic,
+        includeIntroOutro: clip.includeIntroOutro,
+        captions,
+      });
+      await updateClipRow(clip.id, userId, {
+        renderPath: rendered.renderPath,
+        renderStatus: 'ready',
+        fileSizeBytes: rendered.fileSizeBytes,
+        durationSec: rendered.durationSec,
+      });
+      return { renderPath: rendered.renderPath, fileSizeBytes: rendered.fileSizeBytes };
+    } catch {
+      return null;
+    }
+  }
 
   app.get('/api/clips/:id/video', requireAuth, async (req: AuthRequest, res) => {
     try {
       const u = req.authUser!;
       const clipId = Number(req.params.id);
       const clip = await getClipByIdForUser(clipId, u.id);
-      if (!clip || !clip.renderPath) {
+      if (!clip) {
         return res.status(404).json({ error: 'Rendered clip video not found.' });
       }
 
-      const stat = await fsp.stat(clip.renderPath).catch(() => null);
+      const resolvedRender = await ensureRenderedClipOnDisk(clip, u.id);
+      if (!resolvedRender) {
+        return res.status(404).json({ error: 'Rendered file is missing on disk and source media could not be restored.' });
+      }
+
+      const stat = await fsp.stat(resolvedRender.renderPath).catch(() => null);
       if (!stat) {
         return res.status(404).json({ error: 'Rendered file is missing on disk.' });
       }
@@ -650,23 +1003,29 @@ async function startServer() {
       const range = req.headers.range;
       if (range) {
         const parts = range.replace(/bytes=/, '').split('-');
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+        const start = Math.max(0, parseInt(parts[0], 10) || 0);
+        const end = Math.min(stat.size - 1, parts[1] ? parseInt(parts[1], 10) : stat.size - 1);
+        if (start >= stat.size || end < start) {
+          res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+          return res.end();
+        }
         const chunksize = end - start + 1;
         res.writeHead(206, {
           'Content-Range': `bytes ${start}-${end}/${stat.size}`,
           'Accept-Ranges': 'bytes',
           'Content-Length': chunksize,
           'Content-Type': 'video/mp4',
+          'Cache-Control': 'no-store',
         });
-        fs.createReadStream(clip.renderPath, { start, end }).pipe(res);
+        fs.createReadStream(resolvedRender.renderPath, { start, end }).pipe(res);
       } else {
         res.writeHead(200, {
           'Content-Length': stat.size,
           'Content-Type': 'video/mp4',
           'Accept-Ranges': 'bytes',
+          'Cache-Control': 'no-store',
         });
-        fs.createReadStream(clip.renderPath).pipe(res);
+        fs.createReadStream(resolvedRender.renderPath).pipe(res);
       }
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'Streaming failed.' });
@@ -678,7 +1037,7 @@ async function startServer() {
       const u = req.authUser!;
       const clipId = Number(req.params.id);
       const clip = await getClipByIdForUser(clipId, u.id);
-      if (!clip || !clip.renderPath) {
+      if (!clip) {
         return res.status(404).json({ error: 'Rendered clip file not ready for download.' });
       }
 
@@ -689,31 +1048,72 @@ async function startServer() {
 
       let downloadPath = clip.renderPath;
       let fileSize = clip.fileSizeBytes;
+      let tempResPath: string | null = null;
 
       if (requestedRes !== clip.renderResolution) {
         const project = await getProjectByIdForUser(clip.projectId, u.id);
-        if (project?.sourceFilePath) {
+        if (project) {
           const captions = JSON.parse(clip.captionsJson || '[]') as CaptionLine[];
-          const reRendered = await renderClipMp4({
-            clipId: clip.id,
-            sourceFilePath: project.sourceFilePath,
-            startSec: clip.startSec,
-            endSec: clip.endSec,
-            aspectRatio: clip.aspectRatio as AspectRatio,
-            resolution: requestedRes,
-            captionStyle: clip.captionStyle as CaptionStyle,
-            fontFamily: clip.fontFamily,
-            highlightColor: clip.highlightColor,
-            cropX: clip.cropX,
-            enhanceAudio: clip.enhanceAudio,
-            trimSilence: clip.trimSilence,
-            bgMusic: clip.bgMusic,
-            includeIntroOutro: clip.includeIntroOutro,
-            captions,
-          });
-          downloadPath = reRendered.renderPath;
-          fileSize = reRendered.fileSizeBytes;
+          if (!project.sourceFilePath && project.sourceType === 'youtube') {
+            const reRendered = await renderYouTubeMotionClipMp4({
+              clipId: clip.id,
+              thumbnailUrl: project.thumbnailUrl,
+              youtubeId: project.youtubeId,
+              startSec: clip.startSec,
+              endSec: clip.endSec,
+              aspectRatio: clip.aspectRatio as AspectRatio,
+              resolution: requestedRes,
+              captionStyle: normalizeCaptionStyle(clip.captionStyle),
+              videoTheme: normalizeVideoTheme(clip.videoTheme),
+              fontFamily: clip.fontFamily,
+              highlightColor: clip.highlightColor,
+              cropX: clip.cropX,
+              bgMusic: clip.bgMusic,
+              includeIntroOutro: clip.includeIntroOutro,
+              captions,
+            });
+            downloadPath = reRendered.renderPath;
+            fileSize = reRendered.fileSizeBytes;
+            tempResPath = reRendered.renderPath;
+          } else {
+            const resolvedSourcePath = await resolveProjectSourceFile(
+              project.sourceType,
+              project.sourceFilePath
+            ).catch(() => null);
+            if (resolvedSourcePath) {
+              const reRendered = await renderClipMp4({
+                clipId: clip.id,
+                sourceFilePath: resolvedSourcePath,
+                startSec: clip.startSec,
+                endSec: clip.endSec,
+                aspectRatio: clip.aspectRatio as AspectRatio,
+                resolution: requestedRes,
+                captionStyle: normalizeCaptionStyle(clip.captionStyle),
+                videoTheme: normalizeVideoTheme(clip.videoTheme),
+                fontFamily: clip.fontFamily,
+                highlightColor: clip.highlightColor,
+                cropX: clip.cropX,
+                enhanceAudio: clip.enhanceAudio,
+                trimSilence: clip.trimSilence,
+                bgMusic: clip.bgMusic,
+                includeIntroOutro: clip.includeIntroOutro,
+                captions,
+              });
+              downloadPath = reRendered.renderPath;
+              fileSize = reRendered.fileSizeBytes;
+              tempResPath = reRendered.renderPath;
+            }
+          }
         }
+      }
+
+      if (!tempResPath) {
+        const resolvedRender = await ensureRenderedClipOnDisk(clip, u.id);
+        if (!resolvedRender) {
+          return res.status(404).json({ error: 'Rendered clip file not ready for download.' });
+        }
+        downloadPath = resolvedRender.renderPath;
+        fileSize = resolvedRender.fileSizeBytes;
       }
 
       await recordDownloadRow({
@@ -733,9 +1133,51 @@ async function startServer() {
         .replace(/^-|-$/g, '')
         .slice(0, 48);
 
-      res.download(downloadPath, `${safeSlug || `clip-${clip.id}`}-${requestedRes}.mp4`);
+      res.download(downloadPath, `${safeSlug || `clip-${clip.id}`}-${requestedRes}.mp4`, () => {
+        if (tempResPath) {
+          void fsp.unlink(tempResPath).catch(() => {});
+        }
+      });
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'Download failed.' });
+    }
+  });
+
+  app.get('/api/clips/:id/srt', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const u = req.authUser!;
+      const clipId = Number(req.params.id);
+      const clip = await getClipByIdForUser(clipId, u.id);
+      if (!clip) {
+        return res.status(404).json({ error: 'Clip not found.' });
+      }
+      const captions = JSON.parse(clip.captionsJson || '[]') as CaptionLine[];
+      const fallbackCaptions =
+        captions.length > 0
+          ? captions
+          : [
+              {
+                id: `srt-${clip.id}`,
+                start: 0,
+                end: Math.max(2, clip.durationSec),
+                text: clip.hook || clip.title,
+              },
+            ];
+      const srtBody = formatCaptionsToSrt(fallbackCaptions);
+      const safeSlug = clip.title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '')
+        .slice(0, 48);
+
+      res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${safeSlug || `clip-${clip.id}`}.srt"`
+      );
+      res.send(srtBody);
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'SRT export failed.' });
     }
   });
 
@@ -761,9 +1203,12 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`ClipGenius AI server running on http://0.0.0.0:${PORT}`);
   });
+  httpServer.requestTimeout = 0;
+  httpServer.headersTimeout = 120_000;
+  httpServer.keepAliveTimeout = 65_000;
 }
 
 startServer().catch((err) => {

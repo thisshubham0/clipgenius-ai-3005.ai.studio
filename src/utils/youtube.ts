@@ -110,7 +110,10 @@ export function formatFileSize(bytes: number): string {
   if (bytes < 1024 * 1024) {
     return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   }
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 export function clampScore(value: number): number {
@@ -167,4 +170,51 @@ export function splitTranscriptIntoCaptions(
   }
 
   return lines;
+}
+
+export function buildYouTubeEmbedUrl(
+  videoId: string,
+  startSec: number,
+  endSec: number,
+  autoplay = false
+): string {
+  const safeId = YOUTUBE_ID_REGEX.test(videoId) ? videoId : '';
+  if (!safeId) return '';
+  const start = Math.max(0, Math.floor(Number.isFinite(startSec) ? startSec : 0));
+  const end = Math.max(start + 1, Math.ceil(Number.isFinite(endSec) ? endSec : start + 15));
+  const params = new URLSearchParams({
+    start: String(start),
+    end: String(end),
+    rel: '0',
+    modestbranding: '1',
+    playsinline: '1',
+  });
+  if (autoplay) {
+    params.set('autoplay', '1');
+  }
+  return `https://www.youtube.com/embed/${safeId}?${params.toString()}`;
+}
+
+function formatSrtTimestamp(seconds: number): string {
+  const safe = Math.max(0, Number.isFinite(seconds) ? seconds : 0);
+  const totalMs = Math.round(safe * 1000);
+  const hrs = Math.floor(totalMs / 3600000);
+  const mins = Math.floor((totalMs % 3600000) / 60000);
+  const secs = Math.floor((totalMs % 60000) / 1000);
+  const ms = totalMs % 1000;
+  return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+
+export function formatCaptionsToSrt(captions: CaptionLine[]): string {
+  const valid = (captions || []).filter((c) => c.text && c.text.trim().length > 0 && c.end > c.start);
+  if (valid.length === 0) {
+    return '';
+  }
+  return valid
+    .map((line, idx) => {
+      const start = formatSrtTimestamp(line.start);
+      const end = formatSrtTimestamp(Math.max(line.start + 0.3, line.end));
+      return `${idx + 1}\n${start} --> ${end}\n${line.text.trim()}\n`;
+    })
+    .join('\n');
 }

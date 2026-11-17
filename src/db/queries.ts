@@ -1,4 +1,4 @@
-import { and, count, desc, eq } from 'drizzle-orm';
+import { and, count, desc, eq, inArray } from 'drizzle-orm';
 import { db } from './index.ts';
 import { clips, downloads, projects } from './schema.ts';
 import type {
@@ -13,6 +13,7 @@ import type {
   ProjectDTO,
   ScoreBreakdown,
   TranscriptSegment,
+  VideoTheme,
 } from '../shared/types.ts';
 
 const DEFAULT_CONFIG: ProjectConfig = {
@@ -20,6 +21,7 @@ const DEFAULT_CONFIG: ProjectConfig = {
   clipDuration: 30,
   aspectRatio: '9:16',
   captionStyle: 'Modern',
+  videoTheme: 'Original',
   contentStyle: 'Podcast',
   enhanceAudio: true,
   trimSilence: false,
@@ -82,6 +84,7 @@ export function mapClipRow(row: typeof clips.$inferSelect): ClipDTO {
     durationSec: row.durationSec,
     aspectRatio: row.aspectRatio as AspectRatio,
     captionStyle: row.captionStyle as CaptionStyle,
+    videoTheme: (row.videoTheme || 'Original') as VideoTheme,
     fontFamily: row.fontFamily,
     highlightColor: row.highlightColor,
     cropX: row.cropX,
@@ -360,5 +363,23 @@ export async function getDashboardSummaryForUser(
   } catch (error) {
     console.error('Database error in getDashboardSummaryForUser:', error);
     throw new Error('Failed to load dashboard metrics.', { cause: error });
+  }
+}
+
+export async function recoverInterruptedProjects(): Promise<number> {
+  try {
+    const recovered = await db
+      .update(projects)
+      .set({
+        status: 'error',
+        errorMessage: 'Processing was interrupted by a server restart. Click Retry to resume.',
+        updatedAt: new Date(),
+      })
+      .where(inArray(projects.status, ['analyzing', 'analyzed', 'generating']))
+      .returning({ id: projects.id });
+    return recovered.length;
+  } catch (error) {
+    console.error('Database error in recoverInterruptedProjects:', error);
+    return 0;
   }
 }

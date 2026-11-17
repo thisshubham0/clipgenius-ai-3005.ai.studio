@@ -36,6 +36,7 @@ interface AuthContextValue {
   startDemoSession: () => Promise<string>;
   logout: () => Promise<void>;
   refreshProfile: () => Promise<void>;
+  getValidToken: () => Promise<string | null>;
   authFetch: (input: string, init?: RequestInit) => Promise<Response>;
 }
 
@@ -166,15 +167,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [firebaseUser, token, fetchProfileWithToken]);
 
+  const getValidToken = useCallback(async (): Promise<string | null> => {
+    let activeToken = token;
+    if (firebaseUser) {
+      activeToken = await firebaseUser.getIdToken();
+      setToken(activeToken);
+    } else if (!activeToken) {
+      activeToken = await startDemoSession();
+    }
+    return activeToken;
+  }, [firebaseUser, token, startDemoSession]);
+
   const authFetch = useCallback(
     async (input: string, init: RequestInit = {}) => {
-      let activeToken = token;
-      if (firebaseUser) {
-        activeToken = await firebaseUser.getIdToken();
-        setToken(activeToken);
-      } else if (!activeToken) {
-        activeToken = await startDemoSession();
-      }
+      const activeToken = await getValidToken();
 
       const headers = new Headers(init.headers || {});
       if (activeToken) {
@@ -182,7 +188,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       return fetch(input, { ...init, headers });
     },
-    [firebaseUser, token, startDemoSession]
+    [getValidToken]
   );
 
   return (
@@ -198,6 +204,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         startDemoSession,
         logout,
         refreshProfile,
+        getValidToken,
         authFetch,
       }}
     >

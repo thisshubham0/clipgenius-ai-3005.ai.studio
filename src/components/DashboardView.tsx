@@ -91,7 +91,7 @@ export function DashboardView({
               Welcome back, {firstName}
             </h1>
             <p className="mt-1 text-sm text-slate-400">
-              Paste a YouTube link to inspect metadata or upload your video to generate short-form MP4 clips.
+              Paste a YouTube link for direct AI transcript and clip detection, or upload an MP4/MOV to render exports.
             </p>
           </div>
           <div className="flex items-center gap-2.5 shrink-0">

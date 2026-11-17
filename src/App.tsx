@@ -14,7 +14,7 @@ import { AuthProvider, useAuth } from './context/AuthContext';
 import type { ClipDTO, ProjectConfig, ProjectDTO } from './shared/types';
 
 function AppShell() {
-  const { profile, loading, token, startDemoSession, logout } = useAuth();
+  const { authFetch, profile, loading, token, startDemoSession, logout } = useAuth();
   const [viewMode, setViewMode] = useState<'landing' | 'workspace'>(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get('autostart') === '1' ? 'workspace' : 'landing';
@@ -64,6 +64,21 @@ function AppShell() {
     setActiveTab('create');
     setViewMode('workspace');
   };
+
+  const handleEditClipById = useCallback(
+    async (clipId: number) => {
+      const res = await authFetch(`/api/clips/${clipId}/context`);
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Could not load clip for editing.');
+      }
+      setSelectedProjectId(data.project.id);
+      setEditingClip({ clip: data.clip, project: data.project });
+      setActiveTab('editor');
+      setViewMode('workspace');
+    },
+    [authFetch]
+  );
 
   if (viewMode === 'landing') {
     return (
@@ -213,7 +228,10 @@ function AppShell() {
           )}
 
           {activeTab === 'downloads' && (
-            <DownloadsView onOpenProject={handleOpenProject} />
+            <DownloadsView
+              onOpenProject={handleOpenProject}
+              onEditClipById={handleEditClipById}
+            />
           )}
 
           {activeTab === 'settings' && (

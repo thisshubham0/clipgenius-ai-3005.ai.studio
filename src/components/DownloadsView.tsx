@@ -1,18 +1,22 @@
 import React, { useEffect, useState } from 'react';
-import { Download, FolderOpen } from 'lucide-react';
+import { Download, Edit3, FolderOpen, Loader2 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import type { DownloadDTO } from '../shared/types';
+import { downloadClipMp4 } from '../utils/downloadClip';
 import { formatFileSize } from '../utils/youtube';
 
 interface DownloadsViewProps {
   onOpenProject: (projectId: number) => void;
+  onEditClipById: (clipId: number) => Promise<void> | void;
 }
 
-export function DownloadsView({ onOpenProject }: DownloadsViewProps) {
-  const { authFetch, token } = useAuth();
+export function DownloadsView({ onOpenProject, onEditClipById }: DownloadsViewProps) {
+  const { authFetch } = useAuth();
   const [downloads, setDownloads] = useState<DownloadDTO[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [openingClipId, setOpeningClipId] = useState<number | null>(null);
+  const [downloadingId, setDownloadingId] = useState<number | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -35,6 +39,35 @@ export function DownloadsView({ onOpenProject }: DownloadsViewProps) {
       active = false;
     };
   }, [authFetch]);
+
+  const handleOpenEditor = async (clipId: number) => {
+    setError('');
+    setOpeningClipId(clipId);
+    try {
+      await onEditClipById(clipId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not open clip editor.');
+    } finally {
+      setOpeningClipId(null);
+    }
+  };
+
+  const handleDownloadRow = async (item: DownloadDTO) => {
+    setError('');
+    setDownloadingId(item.id);
+    try {
+      await downloadClipMp4({
+        clipId: item.clipId,
+        resolution: item.resolution,
+        clipTitle: item.clipTitle,
+        authFetch,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Download failed.');
+    } finally {
+      setDownloadingId(null);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -101,19 +134,38 @@ export function DownloadsView({ onOpenProject }: DownloadsViewProps) {
                       <div className="inline-flex items-center gap-2">
                         <button
                           type="button"
+                          disabled={openingClipId === item.clipId}
+                          onClick={() => void handleOpenEditor(item.clipId)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-indigo-200 bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/35 rounded-md whitespace-nowrap cursor-pointer disabled:opacity-60"
+                        >
+                          {openingClipId === item.clipId ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                          ) : (
+                            <Edit3 className="w-3.5 h-3.5" aria-hidden="true" />
+                          )}
+                          Edit
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => onOpenProject(item.projectId)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md cursor-pointer"
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md whitespace-nowrap cursor-pointer"
                         >
                           <FolderOpen className="w-3.5 h-3.5" aria-hidden="true" />
                           Project
                         </button>
-                        <a
-                          href={`/api/clips/${item.clipId}/download?resolution=${encodeURIComponent(item.resolution)}&token=${encodeURIComponent(token || '')}`}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-md"
+                        <button
+                          type="button"
+                          disabled={downloadingId === item.id}
+                          onClick={() => void handleDownloadRow(item)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-md whitespace-nowrap cursor-pointer disabled:opacity-60"
                         >
-                          <Download className="w-3.5 h-3.5" aria-hidden="true" />
+                          {downloadingId === item.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                          ) : (
+                            <Download className="w-3.5 h-3.5" aria-hidden="true" />
+                          )}
                           MP4
-                        </a>
+                        </button>
                       </div>
                     </td>
                   </tr>

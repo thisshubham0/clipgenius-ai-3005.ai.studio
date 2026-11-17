@@ -59,6 +59,7 @@ export const clips = pgTable('clips', {
   durationSec: real('duration_sec').notNull(),
   aspectRatio: text('aspect_ratio').default('9:16').notNull(),
   captionStyle: text('caption_style').default('Modern').notNull(),
+  videoTheme: text('video_theme').default('Original').notNull(),
   fontFamily: text('font_family').default('Plus Jakarta Sans').notNull(),
   highlightColor: text('highlight_color').default('#38BDF8').notNull(),
   cropX: real('crop_x').default(0.5).notNull(),

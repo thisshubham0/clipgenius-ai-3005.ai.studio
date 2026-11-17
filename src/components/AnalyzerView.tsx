@@ -9,8 +9,8 @@ import {
   Link2,
   Loader2,
   RefreshCw,
-  ShieldAlert,
   Sparkles,
+  Subtitles,
   Upload,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
@@ -24,9 +24,13 @@ import type {
   ProjectConfig,
   ProjectDTO,
   StudioSample,
+  VideoTheme,
   YouTubeInspectResult,
 } from '../shared/types';
-import { formatFileSize, formatTimecode, parseYouTubeUrl } from '../utils/youtube';
+import { downloadClipMp4 } from '../utils/downloadClip';
+import { CAPTION_STYLES, VIDEO_THEMES, getVideoThemeMeta, normalizeVideoTheme } from '../utils/videoStyles';
+import { buildYouTubeEmbedUrl, formatFileSize, formatTimecode, parseYouTubeUrl } from '../utils/youtube';
+import { FancyCaptionOverlay } from './FancyCaptionOverlay';
 
 interface AnalyzerViewProps {
   initialProjectId?: number | null;
@@ -43,6 +47,7 @@ const DEFAULT_CONFIG: ProjectConfig = {
   clipDuration: 30,
   aspectRatio: '9:16',
   captionStyle: 'Modern',
+  videoTheme: 'Original',
   contentStyle: 'Podcast',
   enhanceAudio: true,
   trimSilence: false,
@@ -68,7 +73,7 @@ export function AnalyzerView({
   onEditClip,
   onProjectLoaded,
 }: AnalyzerViewProps) {
-  const { authFetch, token, refreshProfile } = useAuth();
+  const { authFetch, getValidToken, token, refreshProfile } = useAuth();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const attachFileRef = useRef<HTMLInputElement | null>(null);
 
@@ -89,9 +94,11 @@ export function AnalyzerView({
 
   const [customClipCount, setCustomClipCount] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ percent: number; loaded: number; total: number } | null>(null);
   const [busyAction, setBusyAction] = useState(false);
   const [error, setError] = useState('');
   const [regeneratingId, setRegeneratingId] = useState<number | null>(null);
+  const [downloadingClipId, setDownloadingClipId] = useState<number | null>(null);
   const [expandedScores, setExpandedScores] = useState<Record<number, boolean>>({});
   const [transcriptQuery, setTranscriptQuery] = useState('');
 
@@ -145,16 +152,19 @@ export function AnalyzerView({
   }, [initialYoutubeUrl]);
 
   // Poll active background processing job
+  const activeProjectId = activeProject?.id;
+  const activeProjectStatus = activeProject?.status;
   useEffect(() => {
     if (
-      !activeProject ||
-      !['analyzing', 'analyzed', 'generating'].includes(activeProject.status)
+      !activeProjectId ||
+      !activeProjectStatus ||
+      !['analyzing', 'analyzed', 'generating'].includes(activeProjectStatus)
     ) {
       return;
     }
 
     const timer = setInterval(() => {
-      void authFetch(`/api/projects/${activeProject.id}`)
+      void authFetch(`/api/projects/${activeProjectId}`)
         .then((res) => (res.ok ? res.json() : null))
         .then((data: { project: ProjectDTO; progress: JobProgress | null } | null) => {
           if (!data) return;
@@ -169,7 +179,7 @@ export function AnalyzerView({
     }, 1500);
 
     return () => clearInterval(timer);
-  }, [activeProject, authFetch, onProjectLoaded, refreshProfile]);
+  }, [activeProjectId, activeProjectStatus, authFetch, onProjectLoaded, refreshProfile]);
 
   const inspectYouTubeLink = async (rawUrl: string) => {
     const parsed = parseYouTubeUrl(rawUrl);
@@ -225,36 +235,64 @@ export function AnalyzerView({
   };
 
   const handleUploadFile = async (file: File, attachToProjectId?: number) => {
+    const MAX_BYTES = 2 * 1024 * 1024 * 1024;
+    if (file.size > MAX_BYTES) {
+      setError(`File size (${formatFileSize(file.size)}) exceeds the 2 GB upload limit.`);
+      return;
+    }
+
     setError('');
     setUploading(true);
+    setUploadProgress({ percent: 0, loaded: 0, total: file.size });
     try {
+      const activeToken = await getValidToken();
       const form = new FormData();
       form.append('video', file);
-      if (attachToProjectId) {
-        const res = await authFetch(`/api/projects/${attachToProjectId}/attach-source`, {
-          method: 'POST',
-          body: form,
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Failed to attach video.');
-        setActiveProject(data.project);
-        setInspectResult(null);
-        onProjectLoaded(data.project);
-      } else {
-        const res = await authFetch('/api/upload', {
-          method: 'POST',
-          body: form,
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Video upload failed.');
-        setActiveProject(data.project);
-        setInspectResult(null);
-        onProjectLoaded(data.project);
-      }
+      const endpoint = attachToProjectId
+        ? `/api/projects/${attachToProjectId}/attach-source`
+        : '/api/upload';
+
+      const data = await new Promise<{ project: ProjectDTO }>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', endpoint);
+        if (activeToken) {
+          xhr.setRequestHeader('Authorization', `Bearer ${activeToken}`);
+        }
+        xhr.upload.onprogress = (evt) => {
+          if (evt.lengthComputable) {
+            setUploadProgress({
+              percent: Math.min(99, Math.round((evt.loaded / evt.total) * 100)),
+              loaded: evt.loaded,
+              total: evt.total,
+            });
+          }
+        };
+        xhr.onload = () => {
+          try {
+            const parsed = JSON.parse(xhr.responseText || '{}');
+            if (xhr.status >= 200 && xhr.status < 300) {
+              setUploadProgress({ percent: 100, loaded: file.size, total: file.size });
+              resolve(parsed as { project: ProjectDTO });
+            } else {
+              reject(new Error(parsed.error || `Upload failed (HTTP ${xhr.status}).`));
+            }
+          } catch {
+            reject(new Error(`Upload failed (HTTP ${xhr.status}).`));
+          }
+        };
+        xhr.onerror = () => reject(new Error('Network error while uploading video file.'));
+        xhr.onabort = () => reject(new Error('Upload was cancelled.'));
+        xhr.send(form);
+      });
+
+      setActiveProject(data.project);
+      setInspectResult(null);
+      onProjectLoaded(data.project);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Upload failed.');
     } finally {
       setUploading(false);
+      setUploadProgress(null);
     }
   };
 
@@ -367,6 +405,23 @@ export function AnalyzerView({
     }
   };
 
+  const handleDownloadClipMp4 = async (clip: ClipDTO) => {
+    setError('');
+    setDownloadingClipId(clip.id);
+    try {
+      await downloadClipMp4({
+        clipId: clip.id,
+        resolution: clip.renderResolution,
+        clipTitle: clip.title,
+        authFetch,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'MP4 download failed.');
+    } finally {
+      setDownloadingClipId(null);
+    }
+  };
+
   const isRunning = Boolean(
     activeProject && ['analyzing', 'analyzed', 'generating'].includes(activeProject.status)
   );
@@ -459,15 +514,16 @@ export function AnalyzerView({
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 pt-2 border-t border-white/10">
             <div className="lg:col-span-5 space-y-3">
               <p className="text-xs font-medium text-slate-300">
-                Or Upload Local Video (MP4, MOV, WebM up to 250 MB)
+                Or Upload Local Video (MP4, MOV, WebM, MKV up to 2 GB · 3 hours)
               </p>
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm"
+                accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.m4v,.mkv"
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
+                  e.target.value = '';
                   if (f) void handleUploadFile(f);
                 }}
               />
@@ -483,10 +539,22 @@ export function AnalyzerView({
                   <Upload className="w-6 h-6 text-slate-400 mx-auto" aria-hidden="true" />
                 )}
                 <p className="text-sm font-medium text-white">
-                  {uploading ? 'Uploading and inspecting stream...' : 'Choose MP4 / MOV / WebM file'}
+                  {uploading && uploadProgress
+                    ? `Uploading ${uploadProgress.percent}% (${formatFileSize(uploadProgress.loaded)} / ${formatFileSize(uploadProgress.total)})`
+                    : uploading
+                      ? 'Inspecting video stream...'
+                      : 'Choose MP4 / MOV / WebM / MKV file'}
                 </p>
+                {uploading && uploadProgress && (
+                  <div className="h-1.5 w-full max-w-xs mx-auto rounded-full bg-white/10 overflow-hidden">
+                    <div
+                      className="h-full bg-indigo-500 transition-all duration-150"
+                      style={{ width: `${uploadProgress.percent}%` }}
+                    />
+                  </div>
+                )}
                 <p className="text-xs text-slate-500">
-                  Processed directly on server with FFmpeg and Gemini Speech-to-Text
+                  Processed directly on server with FFmpeg and Gemini Multimodal AI
                 </p>
               </button>
 
@@ -593,17 +661,17 @@ export function AnalyzerView({
                 {activeProject.title}
               </h2>
 
-              {!activeProject.hasMediaSource ? (
-                <div className="mt-3 p-4 rounded-lg bg-amber-950/30 border border-amber-500/30 space-y-3">
+              {!activeProject.hasMediaSource && activeProject.sourceType === 'youtube' ? (
+                <div className="mt-3 p-4 rounded-lg bg-[#090B10] border border-indigo-500/30 space-y-3">
                   <div className="flex items-start gap-2.5">
-                    <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
-                    <div className="text-xs text-amber-100 space-y-1 leading-relaxed">
-                      <p className="font-semibold text-amber-300">
-                        Permission &amp; Accessibility Check
+                    <Sparkles className="w-5 h-5 text-indigo-400 shrink-0 mt-0.5" aria-hidden="true" />
+                    <div className="text-xs text-slate-200 space-y-1 leading-relaxed">
+                      <p className="font-semibold text-indigo-300">
+                        YouTube Direct AI Analysis Ready
                       </p>
-                      <p>
+                      <p className="text-slate-300">
                         {inspectResult?.permissionReason ||
-                          'Direct YouTube stream extraction is restricted by platform terms and DRM protections. Attach your authorized video file or select an Authorized Studio Sample below to generate real MP4 clips.'}
+                          'ClipGenius AI analyzes this YouTube video directly to generate timestamped transcripts, viral hooks, engagement scores, SRT captions, and timestamped clip previews. Attach an MP4/MOV file anytime if you also want standalone FFmpeg MP4 downloads.'}
                       </p>
                     </div>
                   </div>
@@ -611,10 +679,11 @@ export function AnalyzerView({
                     <input
                       ref={attachFileRef}
                       type="file"
-                      accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm"
+                      accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.m4v,.mkv"
                       className="hidden"
                       onChange={(e) => {
                         const f = e.target.files?.[0];
+                        e.target.value = '';
                         if (f) void handleUploadFile(f, activeProject.id);
                       }}
                     />
@@ -622,35 +691,39 @@ export function AnalyzerView({
                       type="button"
                       disabled={uploading}
                       onClick={() => attachFileRef.current?.click()}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <Upload className="w-3.5 h-3.5" aria-hidden="true" />
-                      {uploading ? 'Uploading...' : 'Upload Source MP4'}
+                      {uploading && uploadProgress
+                        ? `Uploading ${uploadProgress.percent}%...`
+                        : uploading
+                          ? 'Inspecting...'
+                          : 'Attach Source MP4 (Optional)'}
                     </button>
                     {samples[0] && (
                       <button
                         type="button"
                         disabled={busyAction}
                         onClick={() => void handleUseSample(samples[0].id, activeProject.id)}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-100 bg-white/10 hover:bg-white/15 border border-white/10 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
                       >
                         <FileVideo className="w-3.5 h-3.5" aria-hidden="true" />
-                        {busyAction ? 'Attaching Sample...' : 'Attach Authorized Studio Sample'}
+                        {busyAction ? 'Attaching Sample...' : 'Switch to Studio Sample'}
                       </button>
                     )}
                   </div>
                 </div>
-              ) : (
+              ) : activeProject.hasMediaSource ? (
                 <p className="text-xs text-emerald-400 flex items-center gap-1.5 pt-1">
                   <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
-                  Authorized video stream ready for FFmpeg audio extraction &amp; AI clipping
+                  Authorized video stream ready for FFmpeg audio extraction, AI clipping &amp; MP4 rendering
                 </p>
-              )}
+              ) : null}
             </div>
           </div>
 
           {/* Step 2 & 3: Clip Generation Controls */}
-          {activeProject.hasMediaSource && (
+          {(activeProject.hasMediaSource || activeProject.sourceType === 'youtube') && (
             <div className="pt-5 border-t border-white/10 space-y-5">
               <div className="flex items-center justify-between">
                 <h3 className="font-display text-base font-semibold text-white">
@@ -764,11 +837,31 @@ export function AnalyzerView({
                     }
                     className="w-full px-3 py-2 text-xs bg-[#090B10] border border-white/10 rounded-md text-white"
                   >
-                    <option value="Modern">Modern</option>
-                    <option value="Animated">Animated</option>
-                    <option value="Bold">Bold</option>
-                    <option value="Karaoke">Karaoke</option>
-                    <option value="Minimal">Minimal</option>
+                    {CAPTION_STYLES.map((st) => (
+                      <option key={st.id} value={st.id}>
+                        {st.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label htmlFor="cfg-theme" className="block text-xs font-medium text-slate-300 mb-1.5">
+                    Video Theme
+                  </label>
+                  <select
+                    id="cfg-theme"
+                    value={normalizeVideoTheme(config.videoTheme)}
+                    onChange={(e) =>
+                      setConfig((c) => ({ ...c, videoTheme: e.target.value as VideoTheme }))
+                    }
+                    className="w-full px-3 py-2 text-xs bg-[#090B10] border border-white/10 rounded-md text-white"
+                  >
+                    {VIDEO_THEMES.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.label}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -934,20 +1027,22 @@ export function AnalyzerView({
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
             {activeProject.clips.map((clip) => {
               const showScores = Boolean(expandedScores[clip.id]);
+              const themeMeta = getVideoThemeMeta(clip.videoTheme);
+              const isDownloading = downloadingClipId === clip.id;
               return (
                 <article
                   key={clip.id}
                   className="rounded-xl bg-[#111520] border border-white/10 overflow-hidden flex flex-col justify-between"
                 >
                   <div>
-                    {/* Video Preview */}
-                    <div className="bg-black flex items-center justify-center relative">
+                    <div className="bg-black flex flex-col items-center justify-center relative overflow-hidden">
                       {clip.renderStatus === 'ready' ? (
                         <video
+                          key={`${clip.id}-${clip.renderStatus}-${clip.fileSizeBytes}`}
                           controls
                           playsInline
                           preload="metadata"
-                          src={`${clip.videoUrl}?token=${encodeURIComponent(token || '')}&v=${encodeURIComponent(clip.createdAt)}`}
+                          src={`${clip.videoUrl}?token=${encodeURIComponent(token || '')}&s=${clip.renderStatus}&sz=${clip.fileSizeBytes}&v=${encodeURIComponent(clip.createdAt)}`}
                           className={`w-full ${
                             clip.aspectRatio === '9:16'
                               ? 'max-h-[420px] aspect-[9/16]'
@@ -956,6 +1051,34 @@ export function AnalyzerView({
                                 : 'aspect-video'
                           } object-contain bg-black`}
                         />
+                      ) : activeProject.youtubeId ? (
+                        <div className="w-full flex flex-col">
+                          <div className="relative overflow-hidden">
+                            <iframe
+                              title={`YouTube clip preview: ${clip.title}`}
+                              src={buildYouTubeEmbedUrl(activeProject.youtubeId, clip.startSec, clip.endSec)}
+                              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                              allowFullScreen
+                              referrerPolicy="strict-origin-when-cross-origin"
+                              style={{ filter: themeMeta.cssFilter }}
+                              className="w-full aspect-video border-0 bg-black"
+                            />
+                            {themeMeta.overlayClass && (
+                              <div className={`pointer-events-none absolute inset-0 ${themeMeta.overlayClass}`} />
+                            )}
+                          </div>
+                          {clip.captions[0] && (
+                            <div className="px-3 py-2.5 bg-[#090B10] border-t border-white/10 flex justify-center">
+                              <FancyCaptionOverlay
+                                line={clip.captions[0]}
+                                captionStyle={clip.captionStyle}
+                                fontFamily={clip.fontFamily}
+                                highlightColor={clip.highlightColor}
+                                compact
+                              />
+                            </div>
+                          )}
+                        </div>
                       ) : (
                         <div className="w-full h-56 flex flex-col items-center justify-center text-xs text-slate-400 gap-2">
                           {clip.renderStatus === 'rendering' ? (
@@ -964,27 +1087,33 @@ export function AnalyzerView({
                               <span>Rendering MP4...</span>
                             </>
                           ) : (
-                            <span>Render failed — open Editor to retry</span>
+                            <span>Open Editor or Download to render MP4</span>
                           )}
                         </div>
                       )}
                     </div>
 
                     <div className="p-5 space-y-3">
-                      <div className="flex items-center justify-between gap-2 text-xs text-slate-400 font-mono tabular-nums">
-                        <span>
-                          {formatTimecode(clip.startSec)} – {formatTimecode(clip.endSec)} ·{' '}
-                          {Math.round(clip.durationSec)}s · {clip.aspectRatio}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setExpandedScores((prev) => ({ ...prev, [clip.id]: !prev[clip.id] }))
-                          }
-                          className="text-indigo-400 hover:text-indigo-300 font-semibold cursor-pointer whitespace-nowrap"
-                        >
-                          Est. Score {clip.viralScore}/100
-                        </button>
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between gap-2 text-xs text-slate-400 font-mono tabular-nums">
+                          <span>
+                            {formatTimecode(clip.startSec)} – {formatTimecode(clip.endSec)} ·{' '}
+                            {Math.round(clip.durationSec)}s · {clip.aspectRatio}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedScores((prev) => ({ ...prev, [clip.id]: !prev[clip.id] }))
+                            }
+                            className="text-indigo-400 hover:text-indigo-300 font-semibold cursor-pointer whitespace-nowrap shrink-0"
+                          >
+                            Est. {clip.viralScore}/100
+                          </button>
+                        </div>
+                        <p className="text-[11px] text-slate-400 font-mono">
+                          Theme: <span className="text-slate-200">{normalizeVideoTheme(clip.videoTheme)}</span> · Captions:{' '}
+                          <span className="text-indigo-300">{clip.captionStyle}</span>
+                        </p>
                       </div>
 
                       {showScores && (
@@ -1018,37 +1147,60 @@ export function AnalyzerView({
                     </div>
                   </div>
 
-                  <div className="px-5 pb-5 pt-3 border-t border-white/10 flex flex-wrap items-center gap-2">
-                    <a
-                      href={`/api/clips/${clip.id}/download?resolution=${encodeURIComponent(clip.renderResolution)}&token=${encodeURIComponent(token || '')}`}
-                      aria-label={`Download MP4 for ${clip.title}`}
-                      className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-md whitespace-nowrap"
-                    >
-                      <Download className="w-3.5 h-3.5" aria-hidden="true" />
-                      Download ({formatFileSize(clip.fileSizeBytes)})
-                    </a>
-                    <button
-                      type="button"
-                      onClick={() => onEditClip(clip, activeProject)}
-                      aria-label={`Edit ${clip.title}`}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md whitespace-nowrap cursor-pointer"
-                    >
-                      <Edit3 className="w-3.5 h-3.5" aria-hidden="true" />
-                      Edit
-                    </button>
-                    <button
-                      type="button"
-                      disabled={regeneratingId === clip.id}
-                      onClick={() => void handleRegenerateClip(clip.id)}
-                      aria-label={`Regenerate copy for ${clip.title}`}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md whitespace-nowrap cursor-pointer disabled:opacity-60"
-                    >
-                      <RefreshCw
-                        className={`w-3.5 h-3.5 ${regeneratingId === clip.id ? 'animate-spin' : ''}`}
-                        aria-hidden="true"
-                      />
-                      Regenerate
-                    </button>
+                  <div className="px-5 pb-5 pt-3 border-t border-white/10 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={isDownloading}
+                        onClick={() => void handleDownloadClipMp4(clip)}
+                        aria-label={`Download MP4 for ${clip.title}`}
+                        className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-md whitespace-nowrap cursor-pointer disabled:opacity-60"
+                      >
+                        {isDownloading ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                        ) : (
+                          <Download className="w-3.5 h-3.5" aria-hidden="true" />
+                        )}
+                        {isDownloading
+                          ? 'Preparing MP4...'
+                          : clip.renderStatus === 'ready' && clip.fileSizeBytes > 0
+                            ? `Download Video (${formatFileSize(clip.fileSizeBytes)})`
+                            : 'Download Video (MP4)'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onEditClip(clip, activeProject)}
+                        aria-label={`Edit & AI Style ${clip.title}`}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-indigo-200 bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/35 rounded-md whitespace-nowrap cursor-pointer"
+                      >
+                        <Edit3 className="w-3.5 h-3.5" aria-hidden="true" />
+                        Edit &amp; AI Style
+                      </button>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2">
+                      <a
+                        href={`/api/clips/${clip.id}/srt?token=${encodeURIComponent(token || '')}`}
+                        aria-label={`Download SRT captions for ${clip.title}`}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium text-slate-300 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md whitespace-nowrap"
+                      >
+                        <Subtitles className="w-3 h-3" aria-hidden="true" />
+                        Download .SRT
+                      </a>
+                      <button
+                        type="button"
+                        disabled={regeneratingId === clip.id}
+                        onClick={() => void handleRegenerateClip(clip.id)}
+                        aria-label={`Regenerate copy for ${clip.title}`}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium text-slate-300 bg-white/5 hover:bg-white/10 border border-white/10 rounded-md whitespace-nowrap cursor-pointer disabled:opacity-60"
+                      >
+                        <RefreshCw
+                          className={`w-3 h-3 ${regeneratingId === clip.id ? 'animate-spin' : ''}`}
+                          aria-hidden="true"
+                        />
+                        Regenerate Copy
+                      </button>
+                    </div>
                   </div>
                 </article>
               );
